@@ -393,6 +393,7 @@ class FSDPParam:
         # Pre-pad the sharded parameter to avoid padding before all-gather
         padded_sharded_param = param_data.new_zeros(padded_sharded_size)
         if sharded_param.numel() > 0:
+            # 这里narrow是取padded_sharded_param的一个view，然后用真实sharded_param的数据copy进去
             padded_sharded_param.narrow(
                 dim=shard_dim, start=0, length=sharded_param.size(shard_dim)
             ).copy_(sharded_param)

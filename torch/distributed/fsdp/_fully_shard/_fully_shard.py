@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from contextlib import contextmanager
 from typing import Any, cast, NoReturn, overload, TYPE_CHECKING
 from typing_extensions import deprecated
@@ -25,6 +26,7 @@ from ._fsdp_init import (
     _validate_mesh,
     _validate_module,
 )
+from ._fsdp_param import _fsdp_param_debug_log
 from ._fsdp_state import _get_module_fsdp_state, FSDPState
 
 
@@ -51,6 +53,93 @@ cls_to_fsdp_cls: dict[type, type] = {}
 
 def get_cls_to_fsdp_cls() -> dict[type, type]:
     return cls_to_fsdp_cls
+
+
+def _format_mesh_info_for_debug(mesh_info: Any) -> str:
+    parts = [f"type={type(mesh_info).__name__}"]
+    mesh = getattr(mesh_info, "mesh", None)
+    if mesh is not None:
+        parts.append(f"mesh_device={getattr(mesh, 'device_type', None)}")
+        parts.append(f"mesh_shape={tuple(getattr(mesh, 'shape', ()))}")
+    for attr in (
+        "shard_mesh_rank",
+        "shard_mesh_size",
+        "replicate_mesh_rank",
+        "replicate_mesh_size",
+    ):
+        if hasattr(mesh_info, attr):
+            parts.append(f"{attr}={getattr(mesh_info, attr)}")
+    return ", ".join(parts)
+
+
+def _debug_log_pre_init_param_group_inputs(
+    *,
+    state: FSDPState,
+    modules: tuple[nn.Module, ...],
+    managed_modules: list[nn.Module],
+    params: list[nn.Parameter],
+    buffers: list[torch.Tensor],
+    mesh_info: Any,
+    post_forward_mesh_info: FSDPMeshInfo | None,
+    device: torch.device,
+    shard_placement_fn: Callable[[nn.Parameter], ShardPlacementFnResult] | None,
+    mp_policy: MixedPrecisionPolicy,
+    offload_policy: OffloadPolicy,
+    reshard_after_forward: bool | int,
+) -> None:
+    if os.environ.get("FSDP_PARAM_DEBUG", "0") != "1":
+        return
+
+    _fsdp_param_debug_log("fully_shard -> _init_param_group inputs begin")
+    _fsdp_param_debug_log(
+        "fully_shard args summary "
+        f"state_id={id(state)} "
+        f"modules={len(modules)} managed_modules={len(managed_modules)} "
+        f"params={len(params)} buffers={len(buffers)} "
+        f"device={device} "
+        f"reshard_after_forward={reshard_after_forward} "
+        f"shard_placement_fn={getattr(shard_placement_fn, '__name__', repr(shard_placement_fn))} "
+        f"mp_policy={mp_policy} "
+        f"offload_policy={offload_policy}"
+    )
+    _fsdp_param_debug_log(
+        "fully_shard mesh_info " + _format_mesh_info_for_debug(mesh_info)
+    )
+    _fsdp_param_debug_log(
+        "fully_shard post_forward_mesh_info "
+        + (
+            "None"
+            if post_forward_mesh_info is None
+            else _format_mesh_info_for_debug(post_forward_mesh_info)
+        )
+    )
+    _fsdp_param_debug_log(
+        "fully_shard modules="
+        + ", ".join(
+            f"{idx}:{module.__class__.__name__}" for idx, module in enumerate(modules)
+        )
+    )
+
+    max_params_env = os.environ.get("FSDP_PARAM_DEBUG_MAX_PARAMS", "16")
+    try:
+        max_params = max(0, int(max_params_env))
+    except ValueError:
+        max_params = 16
+    for idx, param in enumerate(params[:max_params]):
+        _fsdp_param_debug_log(
+            "fully_shard param "
+            f"idx={idx} "
+            f"id={id(param)} "
+            f"shape={tuple(param.shape)} "
+            f"dtype={param.dtype} "
+            f"device={param.device} "
+            f"requires_grad={param.requires_grad}"
+        )
+    if len(params) > max_params:
+        _fsdp_param_debug_log(
+            f"fully_shard param ... truncated {len(params) - max_params} entries "
+            f"(set FSDP_PARAM_DEBUG_MAX_PARAMS to expand)"
+        )
 
 
 @overload
@@ -216,6 +305,23 @@ def fully_shard(
     )
     state = fully_shard.state(modules[0])  # type: ignore[attr-defined]
     state.init(modules, device, mp_policy, auto_reshard_after_forward)
+    resolved_reshard_after_forward = (
+        reshard_after_forward if not auto_reshard_after_forward else True
+    )
+    _debug_log_pre_init_param_group_inputs(
+        state=state,
+        modules=modules,
+        managed_modules=managed_modules,
+        params=params,
+        buffers=buffers,
+        mesh_info=mesh_info,
+        post_forward_mesh_info=post_forward_mesh_info,
+        device=device,
+        shard_placement_fn=shard_placement_fn,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=resolved_reshard_after_forward,
+    )
 
     _init_param_group(
         state,
@@ -227,9 +333,7 @@ def fully_shard(
         shard_placement_fn,
         mp_policy,
         offload_policy,
-        reshard_after_forward=reshard_after_forward
-        if not auto_reshard_after_forward
-        else True,
+        reshard_after_forward=resolved_reshard_after_forward,
     )
 
     # For Dynamo
