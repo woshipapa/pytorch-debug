@@ -182,6 +182,7 @@ class FSDPState(_State):
                 continue
             if module is not root_module:
                 if state not in visited_states and state._is_root is not None:
+                    # 这里是要先跑root module，如果先跑了子module的forward就会报错
                     raise RuntimeError(
                         f"{self._state_name} state has already been lazily initialized for "
                         f"{module_name}\n{self._state_name} requires running forward through "

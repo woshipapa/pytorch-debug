@@ -314,8 +314,10 @@ class FSDPParamGroup:
             not self.unshard_in_backward
             and self._training_state == TrainingState.PRE_BACKWARD
         ):
+            # 有些在backward都不需要unshard的参数组，用户可以设置`unshard_in_backward=False`来跳过backward的unshard逻辑
             return
         if self._reshard_after_forward_event is not None:
+            # 这里是上一次post forward reshard的event，等到这次unshard的时候才等这个event
             # Resharded parameter data is allocated in the default stream and
             # used in the all-gather streams
             self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)

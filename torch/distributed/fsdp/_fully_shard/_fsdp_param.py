@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 import inspect
 import itertools
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
@@ -67,6 +68,23 @@ it in-place thereafter. For the default ``torch.Tensor` original parameter
 case, the all-gather output and unsharded parameter share the same
 data, so we use storage resizing on the all-gather output.
 """
+
+
+def _fsdp_param_debug_log(message: str) -> None:
+    if os.environ.get("FSDP_PARAM_DEBUG", "0") != "1":
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    if (rank_filter := os.environ.get("FSDP_PARAM_DEBUG_RANK")) is not None:
+        if rank_filter != str(rank):
+            return
+    if (match := os.environ.get("FSDP_PARAM_DEBUG_MATCH")):
+        if match not in message:
+            return
+    print(f"[FSDPParam][rank={rank}] {message}", flush=True)
+
 
 lib = torch.library.Library("fsdp", "FRAGMENT")  # noqa: TOR901
 
@@ -193,6 +211,14 @@ class FSDPParam:
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
         self.grad_offload_event: torch.Event | None = None
+        _fsdp_param_debug_log(
+            "init begin "
+            f"module={module_info.module.__class__.__name__} "
+            f"param={module_info.param_name} "
+            f"shape={tuple(param.shape)} "
+            f"device={param.device} "
+            f"dtype={param.dtype}"
+        )
         self._init_sharded_param(param, device, shard_placement_fn, mesh_info)
         if self.post_forward_mesh_info:
             self._init_sharded_post_forward_param_metadata(param)
@@ -200,6 +226,14 @@ class FSDPParam:
         self.all_gather_outputs: list[torch.Tensor] = []
         self.unsharded_accumulated_grad = None
         self._param_fqn: str | None = None  # prefixed from root module
+        _fsdp_param_debug_log(
+            "init end "
+            f"param={module_info.param_name} "
+            f"mesh={type(self.mesh_info).__name__} "
+            f"placement={self.fsdp_placement} "
+            f"sharded_shape={tuple(self.sharded_param.shape)} "
+            f"sharded_device={self.sharded_param.device}"
+        )
         # TODO: Remove this padding logic once DTensor pads the local tensor:
         # https://github.com/pytorch/pytorch/issues/113045
         self._post_load_hook_handle = (
@@ -329,6 +363,15 @@ class FSDPParam:
         else:  # DDP
             shard_rank = 0
             shard_world_size = 1
+        _fsdp_param_debug_log(
+            "_init_sharded_param mesh resolved "
+            f"param={self._module_info.param_name} "
+            f"mesh={type(self.mesh_info).__name__} "
+            f"shard_dim={shard_dim} "
+            f"shard_rank={shard_rank} "
+            f"shard_world_size={shard_world_size} "
+            f"orig_size={tuple(self._orig_size)}"
+        )
 
         if shard_dim > 0 and param_data.size(shard_dim) % shard_world_size != 0:
             # If sharding on nonzero dim, require even sharding for now because
@@ -370,8 +413,18 @@ class FSDPParam:
         self.sharded_param.requires_grad_(param.requires_grad)
         # Let `param_data` be freed normally when its ref count reaches 0 when
         # the `fully_shard` call returns to allow provided parameters to alias
+        _fsdp_param_debug_log(
+            "_setattr_on_modules begin "
+            f"param={self._module_info.param_name} "
+            f"target_device={self.sharded_param.device}"
+        )
         self._setattr_on_modules(self.sharded_param)
         self.sharded_state = ShardedState.SHARDED
+        _fsdp_param_debug_log(
+            "_setattr_on_modules done "
+            f"param={self._module_info.param_name} "
+            f"sharded_state={self.sharded_state.name}"
+        )
 
     def _init_sharded_post_forward_param_metadata(self, param: torch.Tensor) -> None:
         mesh_info = self.post_forward_mesh_info
